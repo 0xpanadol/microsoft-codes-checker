@@ -1,16 +1,21 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fatih/color"
@@ -18,8 +23,15 @@ import (
 )
 
 const (
-	baseURL   = "https://buynow.production.store-web.dynamics.com/v1.0/Redeem/PrepareRedeem"
-	outputDir = "output"
+	baseURL                 = "https://buynow.production.store-web.dynamics.com/v1.0/Redeem/PrepareRedeem"
+	outputDir               = "output"
+	inputDir                = "input"
+	codesFile               = "codes.txt"
+	wlidsFile               = "wlids.txt"
+	wlidRemovedFile         = "wlids_removed_history.txt"
+	wlidActiveFinalFile     = "wlids_active_final.txt"
+	wlidRemovedFilePath     = outputDir + "/" + wlidRemovedFile
+	wlidActiveFinalFilePath = outputDir + "/" + wlidActiveFinalFile
 )
 
 type CheckRequest struct {
@@ -34,7 +46,6 @@ type CheckRequest struct {
 		DeviceFamily string `json:"deviceFamily"`
 	} `json:"clientContext"`
 }
-
 type CheckResponse struct {
 	Events struct {
 		Cart []struct {
@@ -55,54 +66,165 @@ type CheckResponse struct {
 		Description string `json:"description"`
 	} `json:"products"`
 }
-
 type Result struct {
-	Code    string
-	Status  string
-	Details string
+	Code          string
+	Status        string
+	Details       string
+	IsTimeout     bool
+	IsRateLimited bool
 }
 
-func createOutputDirs() error {
+func createDirsAndFiles() error {
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory %s: %v", outputDir, err)
+		return fmt.Errorf("failed to create dir %s: %v", outputDir, err)
+	}
+	if err := os.MkdirAll(inputDir, 0755); err != nil {
+		return fmt.Errorf("failed to create dir %s: %v", inputDir, err)
+	}
+
+	// Ensure essential input files exist (create empty if not)
+	inputFiles := []string{filepath.Join(inputDir, codesFile), filepath.Join(inputDir, wlidsFile)}
+	for _, fp := range inputFiles {
+		if _, err := os.Stat(fp); os.IsNotExist(err) {
+			fmt.Printf("Creating empty file: %s\n", fp)
+			f, createErr := os.Create(fp)
+			if createErr != nil {
+				return fmt.Errorf("failed to create %s: %v", fp, createErr)
+			}
+			f.Close()
+		}
+	}
+
+	// Ensure output files exist (removed history and final active)
+	outputFiles := []string{wlidRemovedFilePath, wlidActiveFinalFilePath}
+	for _, fp := range outputFiles {
+		// Append/Create for removed history, Truncate/Create for final active
+		flags := os.O_APPEND | os.O_CREATE | os.O_WRONLY
+		if fp == wlidActiveFinalFilePath {
+			flags = os.O_CREATE | os.O_WRONLY | os.O_TRUNC // Overwrite active file
+		}
+		f, err := os.OpenFile(fp, flags, 0644)
+		if err != nil {
+			return fmt.Errorf("failed to create/open %s: %v", fp, err)
+		}
+		f.Close()
 	}
 	return nil
 }
 
-// FileMutex ensures thread-safe file operations
+// File Mutexes
 var (
-	goodFileMutex     sync.Mutex
-	badFileMutex      sync.Mutex
-	errorFileMutex    sync.Mutex
-	expiredFileMutex  sync.Mutex
-	retryFileMutex    sync.Mutex
-	redeemedFileMutex sync.Mutex
+	goodFileMutex        sync.Mutex
+	badFileMutex         sync.Mutex
+	errorFileMutex       sync.Mutex
+	expiredFileMutex     sync.Mutex
+	retryFileMutex       sync.Mutex
+	redeemedFileMutex    sync.Mutex
+	wlidRemovedFileMutex sync.Mutex
+)
+
+// WLID Management
+var (
+	activeWlidList []string
+	wlidListMutex  sync.Mutex
 )
 
 func appendToFile(filename string, content string, mutex *sync.Mutex) error {
 	mutex.Lock()
 	defer mutex.Unlock()
-
 	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-
 	if _, err := file.WriteString(content); err != nil {
 		return err
 	}
 	return nil
 }
 
+// removeWlidAndLog: Removes from active list IN MEMORY and logs to history file
+func removeWlidAndLog(wlidToRemove string, reason string) {
+	if wlidToRemove == "" {
+		return
+	}
+	wlidListMutex.Lock() // Lock for modifying activeWlidList
+
+	found := false
+	newActiveList := make([]string, 0, len(activeWlidList))
+	for _, wlid := range activeWlidList {
+		if wlid == wlidToRemove {
+			found = true
+		} else {
+			newActiveList = append(newActiveList, wlid)
+		}
+	}
+
+	// Only update if found and log to history file
+	if found {
+		activeWlidList = newActiveList
+		wlidListMutex.Unlock() // Unlock BEFORE logging to file (uses different mutex)
+
+		contentToLog := fmt.Sprintf("%s | Reason: %s | Timestamp: %s\n", wlidToRemove, reason, time.Now().Format(time.RFC3339))
+		// Append to the history file
+		err := appendToFile(wlidRemovedFilePath, contentToLog, &wlidRemovedFileMutex)
+		if err != nil {
+			fmt.Printf("\n[Error] Failed to write removed WLID %s to history %s: %v\n", wlidToRemove, wlidRemovedFilePath, err)
+		}
+	} else {
+		wlidListMutex.Unlock() // Unlock if not found
+	}
+}
+
+// Writes the current activeWlidList to the specified file, overwriting it.
+func saveActiveWlids(filePath string) error {
+	wlidListMutex.Lock() // Lock to safely read the final list
+	defer wlidListMutex.Unlock()
+
+	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open %s for writing active WLIDs: %v", filePath, err)
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+	count := 0
+	for _, wlid := range activeWlidList {
+		if _, err := writer.WriteString(wlid + "\n"); err != nil {
+			// Try to flush what we have before returning error
+			_ = writer.Flush()
+			return fmt.Errorf("failed to write WLID %s to %s: %v", wlid, filePath, err)
+		}
+		count++
+	}
+
+	// Flush remaining buffer
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush writer for %s: %v", filePath, err)
+	}
+
+	fmt.Printf("Saved %d active WLIDs to %s.\n", count, filePath)
+	return nil
+}
+
+func getRandomWlid() string {
+	wlidListMutex.Lock()
+	defer wlidListMutex.Unlock()
+	if len(activeWlidList) == 0 {
+		return ""
+	}
+	return activeWlidList[rand.Intn(len(activeWlidList))]
+}
+
 func saveResult(result Result) error {
 	var filename string
 	var mutex *sync.Mutex
-
+	content := result.Code
 	switch result.Status {
 	case "good":
 		filename = filepath.Join(outputDir, "good.txt")
 		mutex = &goodFileMutex
+		content = fmt.Sprintf("%s | %s", result.Code, result.Details)
 	case "bad":
 		filename = filepath.Join(outputDir, "bad.txt")
 		mutex = &badFileMutex
@@ -112,123 +234,48 @@ func saveResult(result Result) error {
 	case "retry":
 		filename = filepath.Join(outputDir, "retry.txt")
 		mutex = &retryFileMutex
+		reason := result.Details
+		if result.IsTimeout {
+			reason = "Network Timeout"
+		} else if result.IsRateLimited {
+			reason = "Rate Limited"
+		}
+		content = fmt.Sprintf("%s | %s", result.Code, reason)
 	case "redeemed":
 		filename = filepath.Join(outputDir, "redeemed.txt")
 		mutex = &redeemedFileMutex
 	default:
 		filename = filepath.Join(outputDir, "error.txt")
 		mutex = &errorFileMutex
+		content = fmt.Sprintf("%s | %s", result.Code, result.Details)
 	}
-
-	return appendToFile(filename, result.Code+"\n", mutex)
+	return appendToFile(filename, content+"\n", mutex)
 }
 
-func checkCode(code string, wlids []string) Result {
-	// Clean the code by removing any whitespace
+func checkCode(client *http.Client, code string, wlidToUse string) Result {
 	code = strings.TrimSpace(code)
-
-	// Skip empty codes
 	if code == "" {
-		return Result{
-			Code:    code,
-			Status:  "error",
-			Details: "Empty code",
-		}
+		return Result{Code: code, Status: "error", Details: "Empty code"}
 	}
-
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-
-	reqBody := CheckRequest{
-		Market:   "MX",
-		Language: "es-MX",
-		Flights: []string{
-			"sc_abandonedretry", "sc_addasyncpitelemetry", "sc_adddatapropertyiap", "sc_addfocuslocktosubscriptionmodal",
-			"sc_additionalv2locales", "sc_aemparamforimage", "sc_aemrdslocale", "sc_allowbuynowrupay",
-			"sc_allowcustompifiltering", "sc_allowelo", "sc_allowfincastlerewardsforsubs", "sc_allowmpesapi",
-			"sc_allowparallelorderload", "sc_allowpaypay", "sc_allowpaypayforcheckout", "sc_allowpaysafecard",
-			"sc_allowpaysafeforus", "sc_allowrupay", "sc_allowrupayforcheckout", "sc_allowsmdmarkettobeprimarypi",
-			"sc_allowupi", "sc_allowupiforbuynow", "sc_allowupiforcheckout", "sc_allowupiqr", "sc_allowupiqrforbuynow",
-			"sc_allowupiqrforcheckout", "sc_allowvenmo", "sc_allowvenmoforbuynow", "sc_allowvenmoforcheckout",
-			"sc_allowverve", "sc_analyticsforbuynow", "sc_announcementtsenabled", "sc_apperrorboundarytsenabled",
-			"sc_askaparentinsufficientbalance", "sc_askaparentssr", "sc_askaparenttsenabled", "sc_asyncpiurlupdate",
-			"sc_asyncpurchasefailure", "sc_asyncpurchasefailurexboxcom", "sc_authactionts", "sc_autorenewalconsentnarratorfix",
-			"sc_bankchallenge", "sc_bankchallengecheckout", "sc_blockcsvpurchasefrombuynow", "sc_blocklegacyupgrade",
-			"sc_buynowfocustrapkeydown", "sc_buynowglobalpiadd", "sc_buynowlistpichanges", "sc_buynowprodigilegalstrings",
-			"sc_buynowuipreload", "sc_buynowuiprod", "sc_cartcofincastle", "sc_cartrailexperiment1", "sc_cat2itemsfix",
-			"sc_cawarrantytermsv2", "sc_checkoutglobalpiadd", "sc_checkoutitemfontweight", "sc_checkoutredeem",
-			"sc_clientdebuginfo", "sc_clienttelemetryforceenabled", "sc_clienttorequestorid", "sc_contactpreferenceactionts",
-			"sc_contactpreferenceupdate", "sc_contactpreferenceupdatexboxcom", "sc_conversionblockederror", "sc_cpdeclinedv2",
-			"sc_culturemarketinfo", "sc_delayretry", "sc_devicerepairpifilter", "sc_digitallicenseterms",
-			"sc_disableupgradetrycheckout", "sc_disallowedpaymentoptionstsenabled", "sc_eligibilityapi", "sc_emptycartexperiment",
-			"sc_emptyresultcheck", "sc_enablecartcreationerrorparsing", "sc_enablekakaopay", "sc_errorpageviewfix",
-			"sc_errorstringsts", "sc_euomnibusprice", "sc_expandedpurchasespinner", "sc_extendpagetagtooverride",
-			"sc_fetchlivepersonfromparentwindow", "sc_fincastlebuynowallowlist", "sc_fincastlebuynowv2strings",
-			"sc_fincastlecalculation", "sc_fincastlecallerapplicationidcheck", "sc_fincastleui", "sc_fingerprinttagginglazyload",
-			"sc_fixforcalculatingtax", "sc_fixredeemautorenew", "sc_flexsubs", "sc_giftingtelemetryfix", "sc_giftlabelsupdate",
-			"sc_giftserversiderendering", "sc_globalhidecssphonenumber", "sc_greenshipping", "sc_handledccemptyresponse",
-			"sc_hidegcolinefees", "sc_hidesubscriptionprice", "sc_highresolutionimageforredeem", "sc_hipercard",
-			"sc_imagelazyload", "sc_inlineshippingselectorgco", "sc_inlineshippingselectormsa", "sc_inlinetempfix",
-			"sc_jarvisconsumerprofile", "sc_jarvisinvalidculture", "sc_klarna", "sc_lineitemactionts", "sc_livepersonlistener",
-			"sc_loadingspinner", "sc_lowbardiscountmap", "sc_mapinapppostdata", "sc_marketswithmigratingcssphonenumber",
-			"sc_morayfont", "sc_moraystyle", "sc_narratoraddress", "sc_newcheckoutselectorforxboxcom", "sc_newconversionurl",
-			"sc_newflexiblepaymentsmessage", "sc_nextpidl", "sc_noawaitforupdateordercall", "sc_officescds",
-			"sc_optionalcatalogclienttype", "sc_ordercheckoutfix", "sc_orderpisyncdisabled", "sc_outofstock",
-			"sc_passthroughculture", "sc_paymentchallengets", "sc_paymentoptionnotfound", "sc_paymentsessioninsummarypage",
-			"sc_pidlignoreesckey", "sc_pitelemetryupdates", "sc_preloadpidlcontainerts", "sc_productforlicenseterms",
-			"sc_productimageoptimization", "sc_prominenteddchange", "sc_promocode", "sc_psd2forgco", "sc_purchaseblock",
-			"sc_purchaseblockerrorhandling", "sc_purchasedblocked", "sc_purchasedblockedby", "sc_quantitycap", "sc_railv2",
-			"sc_reactcheckout", "sc_readytopurchasefix", "sc_recochannelts", "sc_redeemfocusforce", "sc_redeemgotolink",
-			"sc_reloadiflineitemdiscrepancy", "sc_removeresellerforstoreapp", "sc_resellerdetail", "sc_returnoospsatocart",
-			"sc_rspv2", "sc_scenariotelemetryrefactor", "sc_separatedigitallicenseterms", "sc_setbehaviordefaultvalue",
-			"sc_shippingallowlist", "sc_showcontactsupportlink", "sc_showtax", "sc_skippurchaseconfirm", "sc_skipselectpi",
-			"sc_splipidltresourcehelper", "sc_surveyurlv2", "sc_taxamountsubjecttochange", "sc_testflight",
-			"sc_updateallowedpaymentmethodstoadd", "sc_updatebillinginfo", "sc_updateformatjsx", "sc_updateredemptionlink",
-			"sc_updatewarrantycompletesurfaceproinlinelegalterm", "sc_updatewarrantytermslink", "sc_usefullminimaluhf",
-			"sc_usehttpsurlstrings", "sc_usekoreanlegaltermstring", "sc_uuid", "sc_xboxcomnosapi", "sc_xboxrecofix",
-			"sc_xboxredirection", "sc_xdlshipbuffer",
-		},
-		TokenIdentifierValue:     code,
-		SupportsCsvTypeTokenOnly: false,
-		BuyNowScenario:           "redeem",
-		ClientContext: struct {
-			Client       string `json:"client"`
-			DeviceFamily string `json:"deviceFamily"`
-		}{
-			Client:       "AccountMicrosoftCom",
-			DeviceFamily: "Web",
-		},
-	}
-
+	reqBody := CheckRequest{Market: "MX", Language: "es-MX", Flights: []string{"..."}, TokenIdentifierValue: code, SupportsCsvTypeTokenOnly: false, BuyNowScenario: "redeem", ClientContext: struct {
+		Client       string `json:"client"`
+		DeviceFamily string `json:"deviceFamily"`
+	}{Client: "AccountMicrosoftCom", DeviceFamily: "Web"}}
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
-		return Result{
-			Code:    code,
-			Status:  "error",
-			Details: fmt.Sprintf("Error marshaling request: %v", err),
-		}
+		return Result{Code: code, Status: "error", Details: fmt.Sprintf("Marshal err: %v", err)}
 	}
-
 	req, err := http.NewRequest("POST", baseURL+"?appId=RedeemNow&context=LookupToken", bytes.NewBuffer(jsonData))
 	if err != nil {
-		return Result{
-			Code:    code,
-			Status:  "error",
-			Details: fmt.Sprintf("Error creating request: %v", err),
-		}
+		return Result{Code: code, Status: "error", Details: fmt.Sprintf("Req err: %v", err)}
 	}
-
-	// Add headers
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "en")
-	// Add random WLID
-	if len(wlids) > 0 {
-		trimmedWlid := strings.TrimSpace(wlids[rand.Intn(len(wlids))])
-		req.Header.Set("Authorization", trimmedWlid)
+	if wlidToUse != "" {
+		req.Header.Set("Authorization", wlidToUse)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("ms-cv", "wsCJqoR290OCqwUQ."+generateVersionFormat()) // wsCJqoR290OCqwUQ.8.65.3
+	req.Header.Set("ms-cv", "wsCJqoR290OCqwUQ."+generateVersionFormat())
 	req.Header.Set("Origin", "https://www.microsoft.com")
 	req.Header.Set("priority", "u=1, i")
 	req.Header.Set("Referer", "https://www.microsoft.com/")
@@ -236,184 +283,293 @@ func checkCode(code string, wlids []string) Result {
 	req.Header.Set("x-authorization-muid", "753B818B2FAC4BD5838DC9A81EA7CE5F")
 	req.Header.Set("x-ms-market", "MX")
 	req.Header.Set("x-ms-vector-id", "9BA0A7A103DA1DB97463855C3C226D3932CDDB90F48827AFC58DC3377E46FC53")
-
 	resp, err := client.Do(req)
 	if err != nil {
-		return Result{
-			Code:    code,
-			Status:  "error",
-			Details: fmt.Sprintf("Error making request: %v", err),
-		}
+		var netErr net.Error
+		isTimeout := errors.As(err, &netErr) && netErr.Timeout()
+		return Result{Code: code, Status: "retry", Details: fmt.Sprintf("Net err: %v", err), IsTimeout: isTimeout}
 	}
 	defer resp.Body.Close()
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return Result{
-			Code:    code,
-			Status:  "error",
-			Details: fmt.Sprintf("Error reading response: %v", err),
-		}
+		return Result{Code: code, Status: "error", Details: fmt.Sprintf("Read err: %v", err)}
 	}
-
-	// Check if response is empty
 	if len(body) == 0 {
-		return Result{
-			Code:    code,
-			Status:  "error",
-			Details: fmt.Sprintf("Empty response from server (Status: %d)", resp.StatusCode),
-		}
+		return Result{Code: code, Status: "retry", Details: fmt.Sprintf("Empty resp (%d)", resp.StatusCode)}
 	}
-
-	// Try to parse the response
 	var checkResp CheckResponse
-	if err := json.Unmarshal(body, &checkResp); err != nil {
-		// If we can't parse the JSON, check if it contains error indicators
-		bodyStr := string(body)
-
-		// Check for specific error conditions
-		if strings.Contains(bodyStr, "RedeemTokenExpired") {
-			return Result{
-				Code:    code,
-				Status:  "expired",
-				Details: bodyStr,
-			}
-		}
-
-		// If it's a network error or other issue
-		if resp.StatusCode != 200 {
-			return Result{
-				Code:    code,
-				Status:  "error",
-				Details: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, bodyStr),
-			}
-		}
-
-		return Result{
-			Code:    code,
-			Status:  "error",
-			Details: fmt.Sprintf("Error parsing response: %v\nResponse: %s", err, bodyStr),
-		}
+	bodyStr := string(body)
+	if resp.StatusCode == 429 {
+		return Result{Code: code, Status: "retry", Details: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, bodyStr), IsRateLimited: true}
 	}
-
-	// Check for specific error conditions in the parsed response
+	if resp.StatusCode >= 500 {
+		return Result{Code: code, Status: "retry", Details: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, bodyStr)}
+	}
+	if resp.StatusCode >= 400 {
+		if strings.Contains(bodyStr, "RedeemTokenExpired") {
+			return Result{Code: code, Status: "expired", Details: bodyStr}
+		}
+		if strings.Contains(bodyStr, "RedeemTokenAlreadyRedeemed") {
+			return Result{Code: code, Status: "redeemed", Details: bodyStr}
+		}
+		if strings.Contains(bodyStr, "TokenNotFound") {
+			return Result{Code: code, Status: "bad", Details: bodyStr}
+		}
+		if strings.Contains(bodyStr, "TooManyRequests") {
+			return Result{Code: code, Status: "retry", Details: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, bodyStr), IsRateLimited: true}
+		}
+		return Result{Code: code, Status: "error", Details: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, bodyStr)}
+	}
+	if err := json.Unmarshal(body, &checkResp); err != nil {
+		if strings.Contains(bodyStr, "RedeemTokenExpired") {
+			return Result{Code: code, Status: "expired", Details: bodyStr}
+		}
+		if strings.Contains(bodyStr, "RedeemTokenAlreadyRedeemed") {
+			return Result{Code: code, Status: "redeemed", Details: bodyStr}
+		}
+		if strings.Contains(bodyStr, "TokenNotFound") {
+			return Result{Code: code, Status: "bad", Details: bodyStr}
+		}
+		if strings.Contains(bodyStr, "TooManyRequests") {
+			return Result{Code: code, Status: "retry", Details: fmt.Sprintf("Non-JSON (%d): %s", resp.StatusCode, bodyStr), IsRateLimited: true}
+		}
+		return Result{Code: code, Status: "error", Details: fmt.Sprintf("JSON err (%d): %v\nResp: %s", resp.StatusCode, err, bodyStr)}
+	}
 	if len(checkResp.Events.Cart) > 0 {
 		for _, event := range checkResp.Events.Cart {
+			if event.Data.Reason == "TooManyRequests" {
+				return Result{Code: code, Status: "retry", Details: bodyStr, IsRateLimited: true}
+			}
 			switch event.Data.Reason {
 			case "TokenNotFound":
-				return Result{
-					Code:    code,
-					Status:  "bad",
-					Details: string(body),
-				}
-			case "TooManyRequests":
-				return Result{
-					Code:    code,
-					Status:  "retry",
-					Details: string(body),
-				}
+				return Result{Code: code, Status: "bad", Details: bodyStr}
 			case "RedeemTokenExpired":
-				return Result{
-					Code:    code,
-					Status:  "expired",
-					Details: string(body),
-				}
+				return Result{Code: code, Status: "expired", Details: bodyStr}
 			case "RedeemTokenAlreadyRedeemed":
-				return Result{
-					Code:    code,
-					Status:  "redeemed",
-					Details: string(body),
-				}
+				return Result{Code: code, Status: "redeemed", Details: bodyStr}
+			}
+			if event.Type == "Error" || event.Data.IsUserError {
+				return Result{Code: code, Status: "bad", Details: bodyStr}
 			}
 		}
 	}
-
-	// Determine status based on response
 	if checkResp.TokenType != "" {
-		return Result{
-			Code:    code,
-			Status:  "good",
-			Details: string(body),
+		details := bodyStr
+		if len(checkResp.Products) > 0 && checkResp.Products[0].Title != "" {
+			details = checkResp.Products[0].Title
 		}
-	} else if len(checkResp.Events.Cart) > 0 {
-		return Result{
-			Code:    code,
-			Status:  "bad",
-			Details: string(body),
-		}
+		return Result{Code: code, Status: "good", Details: details}
 	}
+	return Result{Code: code, Status: "bad", Details: fmt.Sprintf("Unknown OK resp (%d): %s", resp.StatusCode, bodyStr)}
+}
 
-	return Result{
-		Code:    code,
-		Status:  "error",
-		Details: string(body),
-	}
+func generateVersionFormat() string {
+	first := rand.Intn(9) + 1
+	second := rand.Intn(90) + 10
+	third := rand.Intn(9) + 1
+	return fmt.Sprintf("%d.%d.%d", first, second, third)
 }
 
 func main() {
-	// Seed the random number generator
 	rand.Seed(time.Now().UnixNano())
 
-	if err := createOutputDirs(); err != nil {
-		fmt.Printf("Error creating output directories: %v\n", err)
+	// Create directories and ensure required files exist
+	if err := createDirsAndFiles(); err != nil {
+		fmt.Printf("Error preparing directories/files: %v\n", err)
 		return
 	}
 
-	// Create input directory if it doesn't exist
-	if err := os.MkdirAll("input", 0755); err != nil {
-		fmt.Printf("Error creating input directory: %v\n", err)
-		return
-	}
-
-	// Check if input files exist
-	if _, err := os.Stat("input/codes.txt"); os.IsNotExist(err) {
-		fmt.Println("Error: input/codes.txt file not found")
-		fmt.Println("Please create the file with one code per line")
-		return
-	}
-
-	if _, err := os.Stat("input/wlids.txt"); os.IsNotExist(err) {
-		fmt.Println("Error: input/wlids.txt file not found")
-		fmt.Println("Please create the file with one WLID per line")
-		return
-	}
-
-	// Read codes from file
-	codes, err := os.ReadFile("input/codes.txt")
+	// --- Load Codes ---
+	codesFilePath := filepath.Join(inputDir, codesFile)
+	codesBytes, err := os.ReadFile(codesFilePath)
 	if err != nil {
-		fmt.Printf("Error reading codes file: %v\n", err)
+		fmt.Printf("Error reading codes file %s: %v\n", codesFilePath, err)
+		return
+	}
+	codeList := []string{}
+	for _, line := range bytes.Split(codesBytes, []byte("\n")) {
+		trimmed := strings.TrimSpace(string(line))
+		if trimmed != "" {
+			codeList = append(codeList, trimmed)
+		}
+	}
+	totalCodes := len(codeList)
+	if totalCodes == 0 {
+		fmt.Println("Error: No valid codes found in", codesFilePath)
 		return
 	}
 
-	// Read WLIDs from file
-	wlids, err := os.ReadFile("input/wlids.txt")
+	wlidInputFilePath := filepath.Join(inputDir, wlidsFile)
+	wlidsBytes, err := os.ReadFile(wlidInputFilePath)
+	initialWlidList := []string{}
+
 	if err != nil {
-		fmt.Printf("Error reading WLIDs file: %v\n", err)
-		return
+		// Error reading WLID file is only a warning now, as the file existence is guaranteed by createDirsAndFiles
+		fmt.Printf("Warning: Error reading WLIDs file %s: %v\n", wlidInputFilePath, err)
+		fmt.Println("Proceeding without WLIDs from file.")
+	} else {
+		lines := bytes.Split(wlidsBytes, []byte("\n"))
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(string(line))
+			if trimmed != "" {
+				initialWlidList = append(initialWlidList, trimmed)
+			}
+		}
 	}
 
-	// Split into lines and convert to strings
-	codeList := bytes.Split(bytes.TrimSpace(codes), []byte("\n"))
-	wlidList := bytes.Split(bytes.TrimSpace(wlids), []byte("\n"))
+	// Initialize the global active list with the full initial list
+	wlidListMutex.Lock()
+	activeWlidList = make([]string, len(initialWlidList))
+	copy(activeWlidList, initialWlidList)
+	initialActiveWlidCount := len(activeWlidList) // Store initial count for summary
+	wlidListMutex.Unlock()
 
-	// Check if we have any codes to process
-	if len(codeList) == 0 {
-		fmt.Println("Error: No codes found in input/codes.txt")
-		return
+	fmt.Printf("Loaded %d codes from %s.\n", totalCodes, codesFilePath)
+	fmt.Printf("Loaded %d initial WLIDs from %s.\n", initialActiveWlidCount, wlidInputFilePath)
+	if initialActiveWlidCount == 0 {
+		fmt.Println("Warning: No WLIDs loaded. Requests may be less reliable.")
 	}
 
-	// Check if we have any WLIDs
-	if len(wlidList) == 0 {
-		fmt.Println("Warning: No WLIDs found in input/wlids.txt. Requests may fail.")
+	reader := bufio.NewReader(os.Stdin)
+	var concurrentMode bool
+	var maxConcurrent int = 1
+	fmt.Print("Run in concurrent mode? (y/n, default n): ")
+	input, _ := reader.ReadString('\n')
+	input = strings.ToLower(strings.TrimSpace(input))
+	if input == "y" || input == "yes" {
+		concurrentMode = true
+		for {
+			fmt.Printf("Enter max concurrent requests (e.g., 10, max %d): ", totalCodes)
+			input, _ = reader.ReadString('\n')
+			input = strings.TrimSpace(input)
+			num, err := strconv.Atoi(input)
+			if err == nil && num > 0 && num <= totalCodes {
+				maxConcurrent = num
+				break
+			}
+			if err == nil && num > totalCodes {
+				fmt.Printf("Setting concurrency to max: %d\n", totalCodes)
+				maxConcurrent = totalCodes
+				break
+			}
+			if err == nil && num <= 0 {
+				fmt.Println("Min 1.")
+			} else {
+				fmt.Println("Invalid.")
+			}
+		}
+		fmt.Printf("Running concurrent with %d workers.\n", maxConcurrent)
+	} else {
+		concurrentMode = false
+		fmt.Println("Running sequential.")
 	}
 
-	// Convert WLID list to strings
-	wlidStrings := make([]string, len(wlidList))
-	for i, wlid := range wlidList {
-		wlidStrings[i] = string(wlid)
+	var (
+		results        []Result
+		processedCount uint64
+		wg             sync.WaitGroup
+		jobs           chan string
+		resultChan     chan Result
+	)
+	var goodCount, badCount, errorCount, expiredCount, retryCount, redeemedCount int64
+	startTime := time.Now()
+
+	if concurrentMode {
+		jobs = make(chan string, totalCodes)
+		resultChan = make(chan Result, totalCodes)
+		fmt.Printf("Starting %d workers...\n", maxConcurrent)
+		for w := 0; w < maxConcurrent; w++ {
+			wg.Add(1)
+			workerClient := &http.Client{Timeout: 45 * time.Second}
+			go worker(w+1, &wg, workerClient, jobs, resultChan)
+		}
+		fmt.Println("Sending jobs...")
+		for _, code := range codeList {
+			jobs <- code
+		}
+		close(jobs)
+		var collectorWg sync.WaitGroup
+		collectorWg.Add(1)
+		go func() {
+			defer collectorWg.Done()
+			for i := 0; i < totalCodes; i++ {
+				result := <-resultChan
+				results = append(results, result)
+				switch result.Status {
+				case "good":
+					atomic.AddInt64(&goodCount, 1)
+				case "bad":
+					atomic.AddInt64(&badCount, 1)
+				case "expired":
+					atomic.AddInt64(&expiredCount, 1)
+				case "retry":
+					atomic.AddInt64(&retryCount, 1)
+				case "redeemed":
+					atomic.AddInt64(&redeemedCount, 1)
+				default:
+					atomic.AddInt64(&errorCount, 1)
+				}
+				if err := saveResult(result); err != nil {
+					fmt.Printf("\nErr save %s: %v\n", result.Code, err)
+				}
+				atomic.AddUint64(&processedCount, 1)
+				currentCount := atomic.LoadUint64(&processedCount)
+				wlidListMutex.Lock()
+				activeWlidsNow := len(activeWlidList)
+				wlidListMutex.Unlock()
+				fmt.Printf("\rProcessed %d/%d (%.1f%%) | Active WLIDs: %d ", currentCount, totalCodes, float64(currentCount)/float64(totalCodes)*100, activeWlidsNow)
+			}
+		}()
+		fmt.Println("\nWaiting...")
+		wg.Wait()
+		close(resultChan)
+		collectorWg.Wait()
+	} else {
+		// ... (Sequential execution) ...
+		client := &http.Client{Timeout: 30 * time.Second}
+		for i, code := range codeList {
+			wlidListMutex.Lock()
+			activeWlidsNow := len(activeWlidList)
+			wlidListMutex.Unlock()
+			fmt.Printf("\rProcessing %d/%d (%.1f%%) | Active WLIDs: %d ", i+1, totalCodes, float64(i+1)/float64(totalCodes)*100, activeWlidsNow)
+			selectedWlid := getRandomWlid()
+			result := checkCode(client, code, selectedWlid)
+			results = append(results, result)
+			if result.Status == "retry" && selectedWlid != "" && (result.IsTimeout || result.IsRateLimited) {
+				reason := "Timeout"
+				if result.IsRateLimited {
+					reason = "Rate Limit"
+				}
+				removeWlidAndLog(selectedWlid, reason)
+			}
+			if err := saveResult(result); err != nil {
+				fmt.Printf("\nErr save %s: %v\n", result.Code, err)
+			}
+			switch result.Status {
+			case "good":
+				goodCount++
+			case "bad":
+				badCount++
+			case "expired":
+				expiredCount++
+			case "retry":
+				retryCount++
+			case "redeemed":
+				redeemedCount++
+			default:
+				errorCount++
+			}
+		}
+		fmt.Println()
 	}
 
-	// Create table writer
+	duration := time.Since(startTime)
+	fmt.Printf("\nProcessing finished in %s.\n", duration)
+
+	if err := saveActiveWlids(wlidActiveFinalFilePath); err != nil {
+		fmt.Printf("\n[Error] Failed to save final active WLID list: %v\n", err)
+	}
+
 	table := tablewriter.NewWriter(os.Stdout)
 	table.SetHeader([]string{"Code", "Status", "Details"})
 	table.SetAutoWrapText(false)
@@ -421,85 +577,88 @@ func main() {
 	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
 	table.SetAlignment(tablewriter.ALIGN_LEFT)
 	table.SetCenterSeparator("")
-	table.SetColumnSeparator("")
+	table.SetColumnSeparator(" | ")
 	table.SetRowSeparator("")
 	table.SetHeaderLine(false)
 	table.SetBorder(false)
-	table.SetTablePadding("\t")
+	table.SetTablePadding("  ")
 	table.SetNoWhiteSpace(true)
-
-	// Process results
-	goodCount := 0
-	badCount := 0
-	errorCount := 0
-	expiredCount := 0
-	retryCount := 0
-	redeemedCount := 0
-
-	// Process codes sequentially
-	totalCodes := len(codeList)
-	for i, code := range codeList {
-		// Print progress
-		fmt.Printf("\rProcessing code %d/%d (%.1f%%)", i+1, totalCodes, float64(i+1)/float64(totalCodes)*100)
-
-		// Check code
-		result := checkCode(string(code), wlidStrings)
-
-		// Save result to file
-		if err := saveResult(result); err != nil {
-			fmt.Printf("\nError saving result for code %s: %v\n", result.Code, err)
-			continue
+	for _, res := range results {
+		detailsDisplay := res.Details
+		maxDetailLen := 80
+		if len(detailsDisplay) > maxDetailLen {
+			detailsDisplay = detailsDisplay[:maxDetailLen] + "..."
 		}
-
-		// Update counters
-		switch result.Status {
+		statusStr := res.Status
+		switch res.Status {
 		case "good":
-			goodCount++
+			statusStr = color.GreenString(res.Status)
 		case "bad":
-			badCount++
+			statusStr = color.RedString(res.Status)
 		case "expired":
-			expiredCount++
+			statusStr = color.YellowString(res.Status)
 		case "retry":
-			retryCount++
+			reason := ""
+			if res.IsTimeout {
+				reason = " (Timeout)"
+			}
+			if res.IsRateLimited {
+				reason = " (Rate Limit)"
+			}
+			statusStr = color.MagentaString(res.Status + reason)
 		case "redeemed":
-			redeemedCount++
-		default:
-			errorCount++
+			statusStr = color.CyanString(res.Status)
+		case "error":
+			statusStr = color.HiRedString(res.Status)
 		}
-
-		// Add to table
-		table.Append([]string{
-			result.Code,
-			result.Status,
-			fmt.Sprintf("%.100s...", result.Details),
-		})
-
-		// Dodge the rate limit
-		time.Sleep(2 * time.Second)
+		table.Append([]string{res.Code, statusStr, detailsDisplay})
 	}
-
-	// Print newline after progress
-	fmt.Println()
-
-	// Print results
 	table.Render()
 
-	// Print summary
-	fmt.Printf("\nSummary:\n")
-	color.Green("Good codes: %d", goodCount)
-	color.Red("Bad codes: %d", badCount)
-	color.Yellow("Expired codes: %d", expiredCount)
-	color.Magenta("Retry codes: %d", retryCount)
-	color.Cyan("Redeemed codes: %d", redeemedCount)
-	color.Yellow("Errors: %d", errorCount)
+	// --- Final Summary ---
+	wlidListMutex.Lock()
+	finalActiveWlids := len(activeWlidList)
+	wlidListMutex.Unlock()
+	removedThisRun := initialActiveWlidCount - finalActiveWlids
+
+	fmt.Printf("\n--- Summary ---\n")
+	color.Green("Good:       %d", goodCount)
+	color.Red("Bad:        %d", badCount)
+	color.Yellow("Expired:    %d", expiredCount)
+	color.Magenta("Retry:      %d", retryCount)
+	color.Cyan("Redeemed:   %d", redeemedCount)
+	color.HiRed("Errors:     %d", errorCount)
+	fmt.Printf("--------------------\n")
+	fmt.Printf("Total Codes: %d\n", totalCodes)
+	fmt.Printf("WLIDs Started With: %d\n", initialActiveWlidCount)
+	fmt.Printf("WLIDs Removed (This Run): %d (logged to %s)\n", removedThisRun, wlidRemovedFilePath)
+	fmt.Printf("WLIDs Active (End of Run): %d (saved to %s)\n", finalActiveWlids, wlidActiveFinalFilePath) // Updated message
+	fmt.Printf("--------------------\n")
+	fmt.Printf("Duration:   %s\n", duration)
+	if concurrentMode && totalCodes > 0 && duration.Seconds() > 0 {
+		rate := float64(totalCodes) / duration.Seconds()
+		fmt.Printf("Rate:       %.2f codes/sec\n", rate)
+	}
+
+	fmt.Printf("\nResults saved to '%s' directory.\n", outputDir)
+	fmt.Printf("History of removed WLIDs (timeouts/rate limits) appended to '%s'.\n", wlidRemovedFilePath)
+	fmt.Printf("Final list of ACTIVE WLIDs (from this run) saved to '%s'.\n", wlidActiveFinalFilePath) // New message
+	fmt.Printf("----> To prepare for the next run, you can manually copy '%s' to '%s'.\n", wlidActiveFinalFilePath, filepath.Join(inputDir, wlidsFile))
+
 }
 
-func generateVersionFormat() string {
-	rand.Seed(time.Now().UnixNano())
-
-	first := rand.Intn(9) + 1    // 1-9
-	second := rand.Intn(90) + 10 // 10-99
-	third := rand.Intn(9) + 1    // 1-9
-
-	return fmt.Sprintf("%d.%d.%d", first, second, third)
+func worker(_ int, wg *sync.WaitGroup, client *http.Client, jobs <-chan string, results chan<- Result) {
+	defer wg.Done()
+	for code := range jobs {
+		selectedWlid := getRandomWlid()
+		result := checkCode(client, code, selectedWlid)
+		if result.Status == "retry" && selectedWlid != "" && (result.IsTimeout || result.IsRateLimited) {
+			reason := "Timeout"
+			if result.IsRateLimited {
+				reason = "Rate Limit"
+			}
+			removeWlidAndLog(selectedWlid, reason)
+		}
+		results <- result
+	}
 }

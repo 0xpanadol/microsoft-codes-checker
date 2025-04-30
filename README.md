@@ -1,13 +1,19 @@
 # Microsoft Store Code Checker
 
-A Go program to check Microsoft Store codes and save the results in organized text files. (Modify the time.Sleep to higher number when you don't have enough WLIDs so you don't get timeout early)
+A Go program to check Microsoft Store codes and save the results in organized text files. The program uses WLIDs for authentication and automatically manages them to avoid timeouts.
 
 ## Features
 
-- Organized output in separate text files (good.txt, bad.txt, error.txt)
-- Beautiful console output with colored summary
+- Organized output in separate text files (good.txt, bad.txt, error.txt, expired.txt, redeemed.txt, retry.txt)
+- Beautiful console output with colored summary and progress table
 - Thread-safe file operations
-- Random WLID selection for authentication to dodge the timeout
+- Automatic WLID management:
+  - Random WLID selection for authentication
+  - Automatic removal of problematic WLIDs
+  - Tracking of removed WLIDs with timestamps and reasons
+  - Final active WLIDs saved for future use
+- Rate limiting and timeout handling
+- Detailed error logging
 
 ## Requirements
 
@@ -36,12 +42,14 @@ A Go program to check Microsoft Store codes and save the results in organized te
    ```
 
 3. Results will be saved in the `output` folder:
-   - `output/good.txt`: List of valid codes
+   - `output/good.txt`: List of valid codes with details
    - `output/expired.txt`: List of expired codes
    - `output/redeemed.txt`: List of redeemed codes
    - `output/bad.txt`: List of invalid codes
-   - `output/error.txt`: List of codes that failed to check
-   - `output/retry.txt`: List of codes that you need to retry with (WLID got timeout cause of too many requests)
+   - `output/error.txt`: List of codes that failed to check with error details
+   - `output/retry.txt`: List of codes that need to be retried (with reason)
+   - `output/wlids_removed_history.txt`: History of removed WLIDs with timestamps and reasons
+   - `output/wlids_active_final.txt`: Final list of active WLIDs after program completion
 
 ## Output
 
@@ -50,7 +58,8 @@ The program provides:
 - Real-time progress in a table format
 - Color-coded summary of results
 - Codes saved in text files, one per line
-- Error handling and logging
+- Detailed error handling and logging
+- WLID management tracking
 
 ## Example
 
@@ -75,13 +84,19 @@ Output files:
 `output/good.txt`:
 
 ```
-KRGQP-HDM6W-J6HW3-V44PH-XXXXX
+KRGQP-HDM6W-J6HW3-V44PH-XXXXX | {"tokenType":"Others","value":null,...}
 ```
 
 `output/bad.txt`:
 
 ```
 XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
+```
+
+`output/wlids_removed_history.txt`:
+
+```
+WLID1.0=t=... | Reason: Rate Limited | Timestamp: 2024-03-14T12:34:56Z
 ```
 
 Console output:
@@ -95,4 +110,6 @@ Summary:
 Good codes: 1
 Bad codes: 1
 Errors: 0
+Active WLIDs: 1
+Removed WLIDs: 1
 ```
